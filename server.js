@@ -1,286 +1,718 @@
-const WebSocket = require('ws');
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const express = require("express");
+const WebSocket = require("ws");
+const fs = require("fs").promises;
+const path = require("path");
+const http = require("http");
+const EventEmitter = require("events");
 
-// Create HTTP server
-const server = http.createServer();
+// Configuration constants
+const CONFIG = {
+  PORT: process.env.PORT || 3001,
+  MAX_CONNECTIONS: parseInt(process.env.MAX_CONNECTIONS) || 1000,
+  HEARTBEAT_INTERVAL: 30000, // 30 seconds
+  AUDIO_RECORDING_DIR: path.join(__dirname, "audio_recordings"),
+  MAX_FILE_SIZE: 100 * 1024 * 1024, // 100MB per session
+  ALLOWED_AUDIO_FORMATS: ["webm", "wav", "mp3"],
+  SESSION_TIMEOUT: 5 * 60 * 1000, // 5 minutes
+};
 
-// Create WebSocket server
-const wss = new WebSocket.Server({ 
-  server,
-  perMessageDeflate: false
-});
+class AudioStreamingServer extends EventEmitter {
+  constructor() {
+    super();
+    this.app = express();
+    this.server = http.createServer(this.app);
+    this.wss = null;
+    this.clients = new Map(); // clientId -> { ws, session, isAlive }
+    this.audioSessions = new Map(); // clientId -> session data
+    this.stats = {
+      totalConnections: 0,
+      activeConnections: 0,
+      totalBytesProcessed: 0,
+      uptime: Date.now(),
+    };
 
-// Store connected clients
-const clients = new Set();
+    this.init();
+  }
 
-// Audio data storage (in production, you might want to use a proper database or file system)
-const audioSessions = new Map();
+  async init() {
+    await this.setupDirectories();
+    this.setupMiddleware();
+    this.setupRoutes();
+    this.setupWebSocket();
+    this.startHeartbeat();
+    this.startSessionCleanup();
+  }
 
-console.log('🎵 Audio Streaming Server Starting...');
-
-wss.on('connection', (ws, req) => {
-  const clientId = generateClientId();
-  clients.add(ws);
-  
-  console.log(`📱 Client ${clientId} connected. Total clients: ${clients.size}`);
-  
-  // Send welcome message
-  ws.send(JSON.stringify({
-    type: 'connection',
-    message: 'Connected to audio streaming server',
-    clientId: clientId
-  }));
-
-  ws.on('message', (data) => {
+  async setupDirectories() {
     try {
-      const message = JSON.parse(data.toString());
-      handleMessage(ws, clientId, message);
-    } catch (error) {
-      console.error(`❌ Error parsing message from client ${clientId}:`, error.message);
-      ws.send(JSON.stringify({
-        type: 'error',
-        message: 'Invalid message format'
-      }));
+      await fs.access(CONFIG.AUDIO_RECORDING_DIR);
+    } catch {
+      await fs.mkdir(CONFIG.AUDIO_RECORDING_DIR, { recursive: true });
     }
-  });
+  }
 
-  ws.on('close', (code, reason) => {
-    clients.delete(ws);
-    // Clean up any ongoing audio session
-    if (audioSessions.has(clientId)) {
-      const session = audioSessions.get(clientId);
+  setupMiddleware() {
+    this.app.use(express.json({ limit: "10mb" }));
+    this.app.use(express.urlencoded({ extended: true }));
+
+    // Security headers
+    this.app.use((req, res, next) => {
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("X-Frame-Options", "DENY");
+      res.setHeader("X-XSS-Protection", "1; mode=block");
+      next();
+    });
+
+    // Request logging
+    this.app.use((req, res, next) => {
+      console.log(`📝 ${new Date().toISOString()} - ${req.method} ${req.path}`);
+      next();
+    });
+
+    // Error handling middleware
+    this.app.use((err, req, res, next) => {
+      console.error("❌ Express Error:", err);
+      res.status(500).json({
+        error: "Internal server error",
+        message:
+          process.env.NODE_ENV === "development"
+            ? err.message
+            : "Something went wrong",
+      });
+    });
+  }
+
+  setupRoutes() {
+    // Health check endpoint with detailed stats
+    this.app.get("/health", (req, res) => {
+      const uptime = Date.now() - this.stats.uptime;
+      res.json({
+        status: "healthy",
+        timestamp: new Date().toISOString(),
+        stats: {
+          ...this.stats,
+          activeConnections: this.clients.size,
+          activeSessions: this.audioSessions.size,
+          uptime: Math.floor(uptime / 1000),
+          memoryUsage: process.memoryUsage(),
+        },
+      });
+    });
+
+    // Get active sessions info
+    this.app.get("/sessions", (req, res) => {
+      const sessions = Array.from(this.audioSessions.entries()).map(
+        ([clientId, session]) => ({
+          clientId,
+          filename: session.filename,
+          startTime: session.startTime,
+          totalChunks: session.totalChunks,
+          totalBytes: session.totalBytes,
+          lastActivity: session.lastActivity,
+          duration: Date.now() - session.startTime,
+        })
+      );
+
+      res.json({ sessions, count: sessions.length });
+    });
+
+    // Force end session endpoint
+    this.app.delete("/sessions/:clientId", (req, res) => {
+      const { clientId } = req.params;
+      const success = this.forceEndSession(clientId);
+
+      if (success) {
+        res.json({ message: `Session ${clientId} ended successfully` });
+      } else {
+        res.status(404).json({ error: "Session not found" });
+      }
+    });
+
+    // Get server metrics
+    this.app.get("/metrics", (req, res) => {
+      res.json({
+        ...this.stats,
+        connections: {
+          current: this.clients.size,
+          max: CONFIG.MAX_CONNECTIONS,
+          utilization:
+            ((this.clients.size / CONFIG.MAX_CONNECTIONS) * 100).toFixed(2) +
+            "%",
+        },
+        sessions: {
+          active: this.audioSessions.size,
+          avgDuration: this.calculateAverageSessionDuration(),
+        },
+        system: {
+          memory: process.memoryUsage(),
+          cpu: process.cpuUsage(),
+          nodeVersion: process.version,
+        },
+      });
+    });
+  }
+
+  setupWebSocket() {
+    this.wss = new WebSocket.Server({
+      server: this.server,
+      clientTracking: false, // We'll handle tracking manually
+      perMessageDeflate: {
+        zlibDeflateOptions: {
+          threshold: 1024, // Only compress messages > 1KB
+          concurrencyLimit: 10,
+        },
+      },
+    });
+
+    this.wss.on("connection", (ws, req) => {
+      if (this.clients.size >= CONFIG.MAX_CONNECTIONS) {
+        console.log("⚠️ Max connections reached, rejecting new connection");
+        ws.close(1013, "Server overloaded");
+        return;
+      }
+
+      const clientId = this.generateClientId();
+      const clientIP = req.socket.remoteAddress;
+
+      // Initialize client data
+      this.clients.set(clientId, {
+        ws,
+        isAlive: true,
+        joinTime: Date.now(),
+        lastActivity: Date.now(),
+        ip: clientIP,
+      });
+
+      this.stats.totalConnections++;
+      this.stats.activeConnections = this.clients.size;
+
+      console.log(
+        `📱 Client ${clientId} connected from ${clientIP}. Total: ${this.clients.size}`
+      );
+
+      // Send welcome message
+      this.sendToClient(clientId, {
+        type: "connection",
+        message: "Connected to audio streaming server",
+        clientId,
+        serverTime: Date.now(),
+        config: {
+          maxFileSize: CONFIG.MAX_FILE_SIZE,
+          sessionTimeout: CONFIG.SESSION_TIMEOUT,
+          supportedFormats: CONFIG.ALLOWED_AUDIO_FORMATS,
+        },
+      });
+
+      // Set up event handlers
+      ws.on("message", (data) => this.handleMessage(clientId, data));
+      ws.on("close", (code, reason) =>
+        this.handleDisconnection(clientId, code, reason)
+      );
+      ws.on("error", (error) => this.handleWebSocketError(clientId, error));
+      ws.on("pong", () => this.handlePong(clientId));
+
+      this.emit("clientConnected", { clientId, ip: clientIP });
+    });
+
+    this.wss.on("error", (error) => {
+      console.error("❌ WebSocket Server Error:", error);
+    });
+  }
+
+  handleMessage(clientId, data) {
+    try {
+      const client = this.clients.get(clientId);
+      if (!client) return;
+
+      client.lastActivity = Date.now();
+
+      // Handle both JSON and binary data
+      let message;
+      if (data instanceof Buffer && data.length > 0) {
+        // Try to parse as JSON first
+        try {
+          message = JSON.parse(data.toString());
+        } catch {
+          // If not JSON, treat as raw audio data
+          this.handleRawAudioData(clientId, data);
+          return;
+        }
+      } else {
+        message = JSON.parse(data.toString());
+      }
+
+      this.routeMessage(clientId, message);
+    } catch (error) {
+      console.error(
+        `❌ Error handling message from ${clientId}:`,
+        error.message
+      );
+      this.sendErrorToClient(clientId, "Invalid message format");
+    }
+  }
+
+  routeMessage(clientId, message) {
+    const handlers = {
+      audio_data: () => this.handleAudioDataMessage(clientId, message),
+      start_session: () => this.startAudioSession(clientId, message),
+      end_session: () => this.endAudioSession(clientId),
+      ping: () => this.handlePing(clientId),
+      get_status: () => this.sendSessionStatus(clientId),
+    };
+
+    const handler = handlers[message.type];
+    if (handler) {
+      handler();
+    } else {
+      this.sendErrorToClient(clientId, `Unknown message type: ${message.type}`);
+    }
+  }
+
+  handleAudioDataMessage(clientId, message) {
+    const { data, timestamp, format = "webm" } = message;
+
+    if (!data) {
+      this.sendErrorToClient(clientId, "No audio data provided");
+      return;
+    }
+
+    if (!CONFIG.ALLOWED_AUDIO_FORMATS.includes(format)) {
+      this.sendErrorToClient(clientId, `Unsupported audio format: ${format}`);
+      return;
+    }
+
+    try {
+      const audioBuffer = Buffer.from(data, "base64");
+      this.processAudioBuffer(clientId, audioBuffer, timestamp || Date.now());
+    } catch (error) {
+      console.error(`❌ Error processing audio data for ${clientId}:`, error);
+      this.sendErrorToClient(clientId, "Failed to process audio data");
+    }
+  }
+
+  handleRawAudioData(clientId, audioBuffer) {
+    this.processAudioBuffer(clientId, audioBuffer, Date.now());
+  }
+
+  async processAudioBuffer(clientId, audioBuffer, timestamp) {
+    let session = this.audioSessions.get(clientId);
+
+    if (!session) {
+      session = await this.createAudioSession(clientId);
+      this.audioSessions.set(clientId, session);
+    }
+
+    // Check file size limit
+    if (session.totalBytes + audioBuffer.length > CONFIG.MAX_FILE_SIZE) {
+      this.sendErrorToClient(clientId, "Session file size limit exceeded");
+      this.forceEndSession(clientId);
+      return;
+    }
+
+    try {
+      // Write to file asynchronously
       if (session.writeStream) {
+        await new Promise((resolve, reject) => {
+          session.writeStream.write(audioBuffer, (error) => {
+            if (error) reject(error);
+            else resolve();
+          });
+        });
+      }
+
+      // Update session stats
+      session.totalChunks++;
+      session.totalBytes += audioBuffer.length;
+      session.lastActivity = timestamp;
+      this.stats.totalBytesProcessed += audioBuffer.length;
+
+      // Process audio chunk for real-time analysis
+      this.analyzeAudioChunk(clientId, audioBuffer);
+
+      // Send acknowledgment
+      this.sendToClient(clientId, {
+        type: "audio_ack",
+        timestamp,
+        bytesReceived: audioBuffer.length,
+        totalBytes: session.totalBytes,
+        totalChunks: session.totalChunks,
+        sessionDuration: timestamp - session.startTime,
+      });
+    } catch (error) {
+      console.error(`❌ Error writing audio for ${clientId}:`, error);
+      this.sendErrorToClient(clientId, "Failed to save audio data");
+    }
+  }
+
+  async createAudioSession(clientId) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const filename = `audio_session_${clientId}_${timestamp}.webm`;
+    const filepath = path.join(CONFIG.AUDIO_RECORDING_DIR, filename);
+
+    const writeStream = require("fs").createWriteStream(filepath);
+
+    const session = {
+      clientId,
+      startTime: Date.now(),
+      filename,
+      filepath,
+      writeStream,
+      totalChunks: 0,
+      totalBytes: 0,
+      lastActivity: Date.now(),
+      format: "webm",
+    };
+
+    writeStream.on("error", (error) => {
+      console.error(`❌ Write stream error for ${clientId}:`, error);
+      this.forceEndSession(clientId);
+    });
+
+    console.log(`🎙️ Created audio session for ${clientId}: ${filename}`);
+    return session;
+  }
+
+  startAudioSession(clientId, options = {}) {
+    if (this.audioSessions.has(clientId)) {
+      this.sendErrorToClient(clientId, "Session already active");
+      return;
+    }
+
+    this.createAudioSession(clientId)
+      .then((session) => {
+        this.audioSessions.set(clientId, session);
+
+        this.sendToClient(clientId, {
+          type: "session_started",
+          sessionId: clientId,
+          filename: session.filename,
+          startTime: session.startTime,
+          maxFileSize: CONFIG.MAX_FILE_SIZE,
+        });
+
+        console.log(`🎬 Started audio session for ${clientId}`);
+      })
+      .catch((error) => {
+        console.error(`❌ Failed to start session for ${clientId}:`, error);
+        this.sendErrorToClient(clientId, "Failed to start audio session");
+      });
+  }
+
+  endAudioSession(clientId) {
+    const session = this.audioSessions.get(clientId);
+    if (!session) {
+      this.sendErrorToClient(clientId, "No active session found");
+      return false;
+    }
+
+    return this.finalizeSession(clientId, session);
+  }
+
+  forceEndSession(clientId) {
+    const session = this.audioSessions.get(clientId);
+    if (!session) return false;
+
+    return this.finalizeSession(clientId, session, true);
+  }
+
+  finalizeSession(clientId, session, forced = false) {
+    try {
+      if (session.writeStream && !session.writeStream.destroyed) {
         session.writeStream.end();
       }
-      audioSessions.delete(clientId);
-    }
-    console.log(`📱 Client ${clientId} disconnected. Code: ${code}, Reason: ${reason}. Total clients: ${clients.size}`);
-  });
 
-  ws.on('error', (error) => {
-    console.error(`❌ WebSocket error for client ${clientId}:`, error.message);
-  });
-});
+      this.audioSessions.delete(clientId);
 
-function handleMessage(ws, clientId, message) {
-  switch (message.type) {
-    case 'audio_data':
-      handleAudioData(ws, clientId, message);
-      break;
-    
-    case 'start_session':
-      startAudioSession(ws, clientId, message);
-      break;
-    
-    case 'end_session':
-      endAudioSession(ws, clientId, message);
-      break;
-    
-    case 'ping':
-      ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
-      break;
-    
-    default:
-      console.log(`📦 Unknown message type from client ${clientId}:`, message.type);
-      ws.send(JSON.stringify({
-        type: 'error',
-        message: `Unknown message type: ${message.type}`
-      }));
-  }
-}
-
-function handleAudioData(ws, clientId, message) {
-  try {
-    const { data, timestamp } = message;
-    const audioBuffer = Buffer.from(data);
-    
-    console.log(`🎵 Received audio chunk from client ${clientId}: ${audioBuffer.length} bytes at ${new Date(timestamp).toISOString()}`);
-    
-    // Get or create audio session for this client
-    let session = audioSessions.get(clientId);
-    if (!session) {
-      session = createAudioSession(clientId);
-      audioSessions.set(clientId, session);
-    }
-    
-    // Write audio data to file (you can modify this to process audio instead)
-    if (session.writeStream) {
-      session.writeStream.write(audioBuffer);
-    }
-    
-    // Update session stats
-    session.totalChunks++;
-    session.totalBytes += audioBuffer.length;
-    session.lastActivity = timestamp;
-    
-    // Process audio data (placeholder for your audio processing logic)
-    processAudioChunk(clientId, audioBuffer, timestamp);
-    
-    // Send acknowledgment back to client
-    ws.send(JSON.stringify({
-      type: 'audio_ack',
-      timestamp: timestamp,
-      bytesReceived: audioBuffer.length,
-      totalBytes: session.totalBytes,
-      totalChunks: session.totalChunks
-    }));
-    
-  } catch (error) {
-    console.error(`❌ Error handling audio data from client ${clientId}:`, error.message);
-    ws.send(JSON.stringify({
-      type: 'error',
-      message: 'Error processing audio data'
-    }));
-  }
-}
-
-function createAudioSession(clientId) {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const filename = `audio_session_${clientId}_${timestamp}.webm`;
-  const filepath = path.join(__dirname, 'audio_recordings', filename);
-  
-  // Ensure recordings directory exists
-  const recordingsDir = path.join(__dirname, 'audio_recordings');
-  if (!fs.existsSync(recordingsDir)) {
-    fs.mkdirSync(recordingsDir, { recursive: true });
-  }
-  
-  const session = {
-    clientId,
-    startTime: Date.now(),
-    filename,
-    filepath,
-    writeStream: fs.createWriteStream(filepath),
-    totalChunks: 0,
-    totalBytes: 0,
-    lastActivity: Date.now()
-  };
-  
-  console.log(`🎵 Created new audio session for client ${clientId}: ${filename}`);
-  
-  return session;
-}
-
-function startAudioSession(ws, clientId, message) {
-  console.log(`🎵 Starting audio session for client ${clientId}`);
-  
-  const session = createAudioSession(clientId);
-  audioSessions.set(clientId, session);
-  
-  ws.send(JSON.stringify({
-    type: 'session_started',
-    sessionId: clientId,
-    filename: session.filename
-  }));
-}
-
-function endAudioSession(ws, clientId, message) {
-  const session = audioSessions.get(clientId);
-  
-  if (session) {
-    console.log(`🎵 Ending audio session for client ${clientId}`);
-    console.log(`   📊 Session stats: ${session.totalChunks} chunks, ${session.totalBytes} bytes, ${((Date.now() - session.startTime) / 1000).toFixed(2)}s duration`);
-    
-    if (session.writeStream) {
-      session.writeStream.end();
-    }
-    
-    audioSessions.delete(clientId);
-    
-    ws.send(JSON.stringify({
-      type: 'session_ended',
-      sessionId: clientId,
-      stats: {
+      const duration = Date.now() - session.startTime;
+      const stats = {
         totalChunks: session.totalChunks,
         totalBytes: session.totalBytes,
-        duration: Date.now() - session.startTime
-      }
-    }));
-  } else {
-    ws.send(JSON.stringify({
-      type: 'error',
-      message: 'No active session found'
-    }));
-  }
-}
+        duration,
+        filename: session.filename,
+      };
 
-function processAudioChunk(clientId, audioBuffer, timestamp) {
-  // Placeholder function for audio processing
-  // Here you can implement:
-  // - Audio analysis (volume, frequency analysis)
-  // - Speech recognition
-  // - Audio filtering or enhancement
-  // - Real-time audio streaming to other clients
-  // - Integration with AI services for transcription
-  
-  // Example: Simple volume analysis
-  const volume = calculateAudioVolume(audioBuffer);
-  
-  if (volume > 0.1) { // Threshold for significant audio
-    console.log(`🔊 Client ${clientId} audio activity detected (volume: ${(volume * 100).toFixed(1)}%)`);
-  }
-}
+      this.sendToClient(clientId, {
+        type: "session_ended",
+        sessionId: clientId,
+        stats,
+        forced,
+      });
 
-function calculateAudioVolume(buffer) {
-  // Simple RMS calculation for audio volume
-  let sum = 0;
-  const samples = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 2);
-  
-  for (let i = 0; i < samples.length; i++) {
-    sum += samples[i] * samples[i];
-  }
-  
-  return Math.sqrt(sum / samples.length) / 32768; // Normalize to 0-1 range
-}
+      console.log(
+        `🏁 ${
+          forced ? "Force " : ""
+        }Ended audio session for ${clientId} - Duration: ${Math.round(
+          duration / 1000
+        )}s, Size: ${(stats.totalBytes / 1024).toFixed(1)}KB`
+      );
 
-function generateClientId() {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
-}
-
-// Cleanup function for graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\n🛑 Shutting down server...');
-  
-  // Close all audio sessions
-  audioSessions.forEach((session, clientId) => {
-    console.log(`🎵 Closing audio session for client ${clientId}`);
-    if (session.writeStream) {
-      session.writeStream.end();
+      this.emit("sessionEnded", { clientId, stats, forced });
+      return true;
+    } catch (error) {
+      console.error(`❌ Error finalizing session for ${clientId}:`, error);
+      return false;
     }
-  });
-  
-  // Close all WebSocket connections
-  clients.forEach(ws => {
-    ws.close(1000, 'Server shutting down');
-  });
-  
-  wss.close(() => {
-    console.log('✅ Server shut down gracefully');
-    process.exit(0);
-  });
-});
-
-// Start the server
-server.listen(3001, () => {
-  console.log('🚀 Audio Streaming Server is running on port 3001');
-  console.log('📡 WebSocket endpoint: ws://localhost:3001');
-  console.log('🎵 Ready to receive audio streams...');
-});
-
-// Health check endpoint
-server.on('request', (req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'healthy',
-      clients: clients.size,
-      activeSessions: audioSessions.size,
-      uptime: process.uptime()
-    }));
-  } else {
-    res.writeHead(404, { 'Content-Type': 'text/plain' });
-    res.end('Not Found');
   }
-});
+
+  analyzeAudioChunk(clientId, audioBuffer) {
+    try {
+      const volume = this.calculateAudioVolume(audioBuffer);
+
+      if (volume > 0.1) {
+        console.log(
+          `🔊 Client ${clientId} audio activity (volume: ${(
+            volume * 100
+          ).toFixed(1)}%)`
+        );
+
+        this.sendToClient(clientId, {
+          type: "audio_analysis",
+          volume: volume,
+          timestamp: Date.now(),
+        });
+      }
+    } catch (error) {
+      console.error(`❌ Error analyzing audio for ${clientId}:`, error);
+    }
+  }
+
+  calculateAudioVolume(buffer) {
+    if (buffer.length < 2) return 0;
+
+    let sum = 0;
+    const samples = new Int16Array(
+      buffer.buffer,
+      buffer.byteOffset,
+      Math.floor(buffer.byteLength / 2)
+    );
+
+    for (let i = 0; i < samples.length; i++) {
+      sum += samples[i] * samples[i];
+    }
+
+    return Math.sqrt(sum / samples.length) / 32768;
+  }
+
+  handlePing(clientId) {
+    this.sendToClient(clientId, {
+      type: "pong",
+      timestamp: Date.now(),
+      serverTime: Date.now(),
+    });
+  }
+
+  handlePong(clientId) {
+    const client = this.clients.get(clientId);
+    if (client) {
+      client.isAlive = true;
+      client.lastActivity = Date.now();
+    }
+  }
+
+  sendSessionStatus(clientId) {
+    const session = this.audioSessions.get(clientId);
+    const client = this.clients.get(clientId);
+
+    this.sendToClient(clientId, {
+      type: "status",
+      hasActiveSession: !!session,
+      sessionInfo: session
+        ? {
+            filename: session.filename,
+            startTime: session.startTime,
+            totalBytes: session.totalBytes,
+            totalChunks: session.totalChunks,
+            duration: Date.now() - session.startTime,
+          }
+        : null,
+      connectionInfo: client
+        ? {
+            joinTime: client.joinTime,
+            lastActivity: client.lastActivity,
+            connectionDuration: Date.now() - client.joinTime,
+          }
+        : null,
+    });
+  }
+
+  handleDisconnection(clientId, code, reason) {
+    const client = this.clients.get(clientId);
+    if (!client) return;
+
+    this.clients.delete(clientId);
+    this.stats.activeConnections = this.clients.size;
+
+    // Clean up any active session
+    if (this.audioSessions.has(clientId)) {
+      this.forceEndSession(clientId);
+    }
+
+    console.log(
+      `📱 Client ${clientId} disconnected (Code: ${code}, Reason: ${reason}). Total: ${this.clients.size}`
+    );
+    this.emit("clientDisconnected", { clientId, code, reason });
+  }
+
+  handleWebSocketError(clientId, error) {
+    console.error(`❌ WebSocket error for client ${clientId}:`, error.message);
+
+    const client = this.clients.get(clientId);
+    if (client && client.ws.readyState === WebSocket.OPEN) {
+      this.sendErrorToClient(clientId, "Connection error occurred");
+    }
+  }
+
+  sendToClient(clientId, message) {
+    const client = this.clients.get(clientId);
+    if (!client || client.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    try {
+      client.ws.send(JSON.stringify(message));
+      return true;
+    } catch (error) {
+      console.error(`❌ Error sending to client ${clientId}:`, error);
+      return false;
+    }
+  }
+
+  sendErrorToClient(clientId, errorMessage) {
+    this.sendToClient(clientId, {
+      type: "error",
+      message: errorMessage,
+      timestamp: Date.now(),
+    });
+  }
+
+  broadcast(message, excludeClientId = null) {
+    let successCount = 0;
+
+    for (const [clientId, client] of this.clients) {
+      if (
+        clientId !== excludeClientId &&
+        client.ws.readyState === WebSocket.OPEN
+      ) {
+        try {
+          client.ws.send(JSON.stringify(message));
+          successCount++;
+        } catch (error) {
+          console.error(`❌ Error broadcasting to client ${clientId}:`, error);
+        }
+      }
+    }
+
+    return successCount;
+  }
+
+  startHeartbeat() {
+    setInterval(() => {
+      const deadClients = [];
+
+      for (const [clientId, client] of this.clients) {
+        if (!client.isAlive) {
+          deadClients.push(clientId);
+          continue;
+        }
+
+        client.isAlive = false;
+        if (client.ws.readyState === WebSocket.OPEN) {
+          client.ws.ping();
+        }
+      }
+
+      // Clean up dead connections
+      deadClients.forEach((clientId) => {
+        console.log(`💀 Removing dead client: ${clientId}`);
+        const client = this.clients.get(clientId);
+        if (client) {
+          client.ws.terminate();
+          this.handleDisconnection(clientId, 1006, "Heartbeat timeout");
+        }
+      });
+    }, CONFIG.HEARTBEAT_INTERVAL);
+  }
+
+  startSessionCleanup() {
+    setInterval(() => {
+      const now = Date.now();
+      const staleSessionIds = [];
+
+      for (const [clientId, session] of this.audioSessions) {
+        if (now - session.lastActivity > CONFIG.SESSION_TIMEOUT) {
+          staleSessionIds.push(clientId);
+        }
+      }
+
+      staleSessionIds.forEach((clientId) => {
+        console.log(`🧹 Cleaning up stale session: ${clientId}`);
+        this.forceEndSession(clientId);
+      });
+    }, CONFIG.SESSION_TIMEOUT / 2); // Check every 2.5 minutes
+  }
+
+  calculateAverageSessionDuration() {
+    if (this.audioSessions.size === 0) return 0;
+
+    const now = Date.now();
+    let totalDuration = 0;
+
+    for (const session of this.audioSessions.values()) {
+      totalDuration += now - session.startTime;
+    }
+
+    return Math.round(totalDuration / this.audioSessions.size / 1000); // in seconds
+  }
+
+  generateClientId() {
+    return Math.random().toString(36).substring(2, 10).toUpperCase();
+  }
+
+  start() {
+    this.server.listen(CONFIG.PORT, () => {
+      console.log(
+        `🚀 Audio Streaming Server started on http://localhost:${CONFIG.PORT}`
+      );
+      console.log(`📡 WebSocket endpoint: ws://localhost:${CONFIG.PORT}`);
+      console.log(`📊 Max connections: ${CONFIG.MAX_CONNECTIONS}`);
+      console.log(
+        `💓 Heartbeat interval: ${CONFIG.HEARTBEAT_INTERVAL / 1000}s`
+      );
+      console.log(`📁 Audio recordings: ${CONFIG.AUDIO_RECORDING_DIR}`);
+    });
+
+    this.server.on("error", (error) => {
+      console.error("❌ Server Error:", error);
+    });
+
+    // Graceful shutdown
+    process.on("SIGTERM", () => this.shutdown());
+    process.on("SIGINT", () => this.shutdown());
+  }
+
+  shutdown() {
+    console.log("🛑 Shutting down server...");
+
+    // Close all WebSocket connections
+    for (const [clientId, client] of this.clients) {
+      client.ws.close(1012, "Server shutting down");
+    }
+
+    // End all active sessions
+    for (const clientId of this.audioSessions.keys()) {
+      this.forceEndSession(clientId);
+    }
+
+    this.server.close(() => {
+      console.log("✅ Server shutdown complete");
+      process.exit(0);
+    });
+  }
+}
+
+// Create and start the server
+const audioServer = new AudioStreamingServer();
+audioServer.start();
+
+// Export for testing or external use
+module.exports = AudioStreamingServer;
