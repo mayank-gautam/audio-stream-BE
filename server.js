@@ -1,8 +1,7 @@
-const express = require("express");
+const fastify = require("fastify");
 const WebSocket = require("ws");
 const fs = require("fs").promises;
 const path = require("path");
-const http = require("http");
 const EventEmitter = require("events");
 
 // Configuration constants
@@ -19,8 +18,25 @@ const CONFIG = {
 class AudioStreamingServer extends EventEmitter {
   constructor() {
     super();
-    this.app = express();
-    this.server = http.createServer(this.app);
+    this.app = fastify({
+      logger: {
+        level: 'info',
+        serializers: {
+          req: (req) => ({
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            hostname: req.hostname,
+            remoteAddress: req.ip,
+            remotePort: req.socket.remotePort
+          })
+        }
+      },
+      bodyLimit: 10485760, // 10MB
+      trustProxy: true
+    });
+    
+    this.server = null;
     this.wss = null;
     this.clients = new Map(); // clientId -> { ws, session, isAlive }
     this.audioSessions = new Map(); // clientId -> session data
@@ -36,11 +52,6 @@ class AudioStreamingServer extends EventEmitter {
 
   async init() {
     await this.setupDirectories();
-    this.setupMiddleware();
-    this.setupRoutes();
-    this.setupWebSocket();
-    this.startHeartbeat();
-    this.startSessionCleanup();
   }
 
   async setupDirectories() {
@@ -51,110 +62,10 @@ class AudioStreamingServer extends EventEmitter {
     }
   }
 
-  setupMiddleware() {
-    this.app.use(express.json({ limit: "10mb" }));
-    this.app.use(express.urlencoded({ extended: true }));
 
-    // Security headers
-    this.app.use((req, res, next) => {
-      res.setHeader("X-Content-Type-Options", "nosniff");
-      res.setHeader("X-Frame-Options", "DENY");
-      res.setHeader("X-XSS-Protection", "1; mode=block");
-      next();
-    });
-
-    // Request logging
-    this.app.use((req, res, next) => {
-      console.log(`📝 ${new Date().toISOString()} - ${req.method} ${req.path}`);
-      next();
-    });
-
-    // Error handling middleware
-    this.app.use((err, req, res, next) => {
-      console.error("❌ Express Error:", err);
-      res.status(500).json({
-        error: "Internal server error",
-        message:
-          process.env.NODE_ENV === "development"
-            ? err.message
-            : "Something went wrong",
-      });
-    });
-  }
-
-  setupRoutes() {
-    // Health check endpoint with detailed stats
-    this.app.get("/health", (req, res) => {
-      const uptime = Date.now() - this.stats.uptime;
-      res.json({
-        status: "healthy",
-        timestamp: new Date().toISOString(),
-        stats: {
-          ...this.stats,
-          activeConnections: this.clients.size,
-          activeSessions: this.audioSessions.size,
-          uptime: Math.floor(uptime / 1000),
-          memoryUsage: process.memoryUsage(),
-        },
-      });
-    });
-
-    // Get active sessions info
-    this.app.get("/sessions", (req, res) => {
-      const sessions = Array.from(this.audioSessions.entries()).map(
-        ([clientId, session]) => ({
-          clientId,
-          filename: session.filename,
-          startTime: session.startTime,
-          totalChunks: session.totalChunks,
-          totalBytes: session.totalBytes,
-          lastActivity: session.lastActivity,
-          duration: Date.now() - session.startTime,
-        })
-      );
-
-      res.json({ sessions, count: sessions.length });
-    });
-
-    // Force end session endpoint
-    this.app.delete("/sessions/:clientId", (req, res) => {
-      const { clientId } = req.params;
-      const success = this.forceEndSession(clientId);
-
-      if (success) {
-        res.json({ message: `Session ${clientId} ended successfully` });
-      } else {
-        res.status(404).json({ error: "Session not found" });
-      }
-    });
-
-    // Get server metrics
-    this.app.get("/metrics", (req, res) => {
-      res.json({
-        ...this.stats,
-        connections: {
-          current: this.clients.size,
-          max: CONFIG.MAX_CONNECTIONS,
-          utilization:
-            ((this.clients.size / CONFIG.MAX_CONNECTIONS) * 100).toFixed(2) +
-            "%",
-        },
-        sessions: {
-          active: this.audioSessions.size,
-          avgDuration: this.calculateAverageSessionDuration(),
-        },
-        system: {
-          memory: process.memoryUsage(),
-          cpu: process.cpuUsage(),
-          nodeVersion: process.version,
-        },
-      });
-    });
-  }
-
-  setupWebSocket() {
+  setupWebSocket(server) {
     this.wss = new WebSocket.Server({
-      server: this.server,
+      server: server,
       clientTracking: false, // We'll handle tracking manually
       perMessageDeflate: {
         zlibDeflateOptions: {
@@ -668,8 +579,24 @@ class AudioStreamingServer extends EventEmitter {
     return Math.random().toString(36).substring(2, 10).toUpperCase();
   }
 
-  start() {
-    this.server.listen(CONFIG.PORT, () => {
+  async start() {
+    try {
+      // Start Fastify server
+      await this.app.listen({
+        port: CONFIG.PORT,
+        host: '0.0.0.0'
+      });
+
+      // Get the underlying HTTP server from Fastify
+      this.server = this.app.server;
+
+      // Setup WebSocket server using the Fastify HTTP server
+      this.setupWebSocket(this.server);
+
+      // Start background processes after server is running
+      this.startHeartbeat();
+      this.startSessionCleanup();
+
       console.log(
         `🚀 Audio Streaming Server started on http://localhost:${CONFIG.PORT}`
       );
@@ -679,18 +606,18 @@ class AudioStreamingServer extends EventEmitter {
         `💓 Heartbeat interval: ${CONFIG.HEARTBEAT_INTERVAL / 1000}s`
       );
       console.log(`📁 Audio recordings: ${CONFIG.AUDIO_RECORDING_DIR}`);
-    });
-
-    this.server.on("error", (error) => {
-      console.error("❌ Server Error:", error);
-    });
+    } catch (error) {
+      console.error("❌ Server startup error:", error);
+      process.exit(1);
+    }
 
     // Graceful shutdown
-    process.on("SIGTERM", () => this.shutdown());
-    process.on("SIGINT", () => this.shutdown());
+    const shutdown = () => this.shutdown();
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
   }
 
-  shutdown() {
+  async shutdown() {
     console.log("🛑 Shutting down server...");
 
     // Close all WebSocket connections
@@ -703,16 +630,20 @@ class AudioStreamingServer extends EventEmitter {
       this.forceEndSession(clientId);
     }
 
-    this.server.close(() => {
+    try {
+      await this.app.close();
       console.log("✅ Server shutdown complete");
       process.exit(0);
-    });
+    } catch (error) {
+      console.error("❌ Error during shutdown:", error);
+      process.exit(1);
+    }
   }
 }
 
 // Create and start the server
 const audioServer = new AudioStreamingServer();
-audioServer.start();
+audioServer.start().catch(console.error);
 
 // Export for testing or external use
 module.exports = AudioStreamingServer;
