@@ -9,37 +9,46 @@ fastify.register(async function (fastify) {
     connection.on("message", (msg) => {
       try {
         const data = JSON.parse(msg.toString());
+        let response = null;
 
-        if (data.format === "pcm16") {
-          const pcmBuffer = new Int16Array(data.data);
-          const base64Audio = Buffer.from(pcmBuffer.buffer).toString("base64");
+        switch (data.format) {
+          case "pcm16": {
+            const pcmBuffer = new Int16Array(data.data);
+            const base64Audio = Buffer.from(pcmBuffer.buffer).toString(
+              "base64"
+            );
 
-          console.log(base64Audio);
+            console.log("🔊 PCM16:", base64Audio.slice(0, 150));
 
-          connection.send(
-            JSON.stringify({
+            response = {
               type: "pcm_received",
               status: "success",
               samples: pcmBuffer.length,
               sampleRate: data.sampleRate,
-            })
-          );
-        } else if (data.type === "audio_data") {
-          const audioBuffer = new Uint8Array(data.data);
-          const base64Audio = Buffer.from(audioBuffer).toString("base64");
-          console.log(base64Audio);
-          
-          connection.send(
-            JSON.stringify({
-              type: "audio_received",
-              status: "success",
-              bufferSize: audioBuffer.length,
-            })
-          );
-        } else {
-          console.log("📩 Received:", msg.toString());
+            };
+            break;
+          }
+
+          default: {
+            if (data.type === "audio_data") {
+              const audioBuffer = new Uint8Array(data.data);
+              const base64Audio = Buffer.from(audioBuffer).toString("base64");
+
+              console.log("🎵 Audio:", base64Audio.slice(0, 150));
+
+              response = {
+                type: "audio_received",
+                status: "success",
+                bufferSize: audioBuffer.length,
+              };
+            } else {
+              console.log("📩 Other message:", data);
+            }
+          }
         }
-      } catch (error) {
+
+        if (response) connection.send(JSON.stringify(response));
+      } catch {
         console.log("📩 Received (non-JSON):", msg.toString());
       }
     });
